@@ -3,6 +3,11 @@
 #include <MFRC522.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <time.h>
+#include <PubSubClient.h>
+#include "secrets.h"
 
 const int RFID_SS_PIN = 5;    // Pin for RFID SS
 const int RFID_SCK_PIN = 18;  // Pin for RFID SCK
@@ -13,12 +18,25 @@ const int FEEDBACK_LED_PIN = 2; // Pin for LED ESP32 Configuration (GPIO2)
 const int OLED_SDA_PIN = 21;
 const int OLED_SCL_PIN = 4;
 const int BUZZER_PIN = 15;
+const int BUZZER_PWM_CHANNEL = 0;
+const int BUZZER_PWM_RESOLUTION_BITS = 8;
+const int BUZZER_ON_DUTY = 128;
+const int BUZZER_OFF_DUTY = 255;
 
 const unsigned long DUPLICATE_SCAN_WINDOW_MS = 3000;
 const unsigned long DISPLAY_RESULT_DURATION_MS = 3000;
+const unsigned int BUZZER_FREQUENCY_HZ = 2500;
 const size_t MAX_UID_LENGTH = 10;
-const int BUZZER_ON_LEVEL = LOW;
-const int BUZZER_OFF_LEVEL = HIGH;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+const time_t MIN_VALID_EPOCH = 1700000000;
+const char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
+const char NTP_SERVER_SECONDARY[] = "time.google.com";
+const char MQTT_BROKER_HOST[] = "192.168.1.2";
+const uint16_t MQTT_BROKER_PORT = 1883;
+const char MQTT_CLIENT_ID[] = "smart-asset-station-01";
+const char MQTT_EVENT_TOPIC[] = "smart-asset/station-01/rfid/events";
+const char MQTT_STATUS_TOPIC[] = "smart-asset/station-01/status";
 
 enum class TagIdentity {
     Unknown,
@@ -50,17 +68,28 @@ struct RegisteredTag {
 };
 
 struct ScanEvent {
+    unsigned long eventId;
     byte uid[MAX_UID_LENGTH];
     size_t uidLength;
     MFRC522::PICC_Type cardType;
     const RegisteredTag* matchedTag;
     unsigned long occurredAtMillis;
+    time_t occurredAtEpoch;
+    bool hasValidTimestamp;
 };
 
 byte lastProcessedUid[MAX_UID_LENGTH] = {};
 size_t lastProcessedUidLength = 0;
 unsigned long lastProcessedScanMillis = 0;
+unsigned long nextScanEventId = 1;
+unsigned long lastWifiConnectionAttemptMillis = 0;
+unsigned long lastMqttConnectionAttemptMillis = 0;
+
 bool hasProcessedUid = false;
+bool wasWifiConnected = false;
+bool hasConfiguredNtp = false;
+bool hasAttemptedMqttConnection = false;
+bool wasMqttConnected = false;
 
 FeedbackPhase feedbackPhase = FeedbackPhase::Idle;
 
@@ -86,6 +115,9 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C oled (
     U8G2_R0,
     U8X8_PIN_NONE
 );
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 const RegisteredTag REGISTERED_TAGS[] = {
     {
@@ -135,19 +167,28 @@ void startScanResultDisplay(const ScanEvent& event);
 
 void updateDisplay(unsigned long currentMillis);
 
+void setFeedbackOutputs(bool active);
+
+void printScanEventJson(const ScanEvent& event);
+
+void startWifiConnection(unsigned long currentMillis);
+
+void updateNetwork(unsigned long currentMillis);
+
+bool formatUtcTimestamp(time_t epoch, char* destination, size_t destinationSize);
+
+void updateMqtt(unsigned long currentMillis);
+
 void setup()
 {
     Serial.begin(115200);
-    digitalWrite(BUZZER_PIN, BUZZER_OFF_LEVEL);
-    pinMode(BUZZER_PIN, OUTPUT);
-
-    Serial.println("Testing Passive Buzzer...");
-    tone(BUZZER_PIN, 2500);
-    delay(500);
-    noTone(BUZZER_PIN);
-    digitalWrite(BUZZER_PIN, BUZZER_OFF_LEVEL);
-
-    Serial.println("Buzzer Test Complete");
+    startWifiConnection(millis());
+    mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+    mqttClient.setKeepAlive(30);
+    mqttClient.setSocketTimeout(2);
+    ledcSetup(BUZZER_PWM_CHANNEL, BUZZER_FREQUENCY_HZ, BUZZER_PWM_RESOLUTION_BITS);
+    ledcAttachPin(BUZZER_PIN, BUZZER_PWM_CHANNEL);
+    ledcWrite(BUZZER_PWM_CHANNEL, BUZZER_OFF_DUTY);
 
     Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
     
@@ -177,6 +218,8 @@ void loop()
 {
     unsigned long currentMillis = millis();
 
+    updateNetwork(currentMillis);
+    updateMqtt(currentMillis);
     updateFeedback(currentMillis);
     updateDisplay(currentMillis);
     updateRfid(currentMillis);
@@ -256,7 +299,7 @@ void startFeedback(FeedbackType type, unsigned long currentMillis) {
     feedbackPhaseStartedMillis = currentMillis; 
     feedbackPhase = FeedbackPhase::On;
 
-    digitalWrite(FEEDBACK_LED_PIN ,HIGH);
+    setFeedbackOutputs(true);
 }
 
 void updateFeedback(unsigned long currentMillis) {
@@ -267,13 +310,14 @@ void updateFeedback(unsigned long currentMillis) {
     if (feedbackPhase == FeedbackPhase::On) {
         if (elapsedMillis < feedbackOnDurationMs) return;
 
-        digitalWrite(FEEDBACK_LED_PIN ,LOW);
         ++feedbackCompletedPulseCount;
 
         if (feedbackCompletedPulseCount >= feedbackTargetPulseCount) {
             stopFeedback();
             return;
         }
+
+        setFeedbackOutputs(false);
 
         feedbackPhase = FeedbackPhase::Off;
         feedbackPhaseStartedMillis = currentMillis;
@@ -283,7 +327,7 @@ void updateFeedback(unsigned long currentMillis) {
     if (feedbackPhase == FeedbackPhase::Off) {
         if (elapsedMillis < feedbackOffDurationMs) return;
 
-        digitalWrite(FEEDBACK_LED_PIN, HIGH);
+        setFeedbackOutputs(true);
 
         feedbackPhase = FeedbackPhase::On;
         feedbackPhaseStartedMillis = currentMillis; 
@@ -291,7 +335,7 @@ void updateFeedback(unsigned long currentMillis) {
 }
 
 void stopFeedback(){
-    digitalWrite(FEEDBACK_LED_PIN ,LOW);
+    setFeedbackOutputs(false);
 
     feedbackPhase = FeedbackPhase::Idle;
     feedbackTargetPulseCount = 0;
@@ -331,12 +375,16 @@ void updateRfid(unsigned long currentMillis) {
     }
     
     printScanEvent(scanEvent);
+    printScanEventJson(scanEvent);
     handleScanEvent(scanEvent);
     rfid.PICC_HaltA(); // Halt PICC
 }
 
 bool buildScanEvent(const MFRC522::Uid& scannedUid, unsigned long currentMillis, ScanEvent& event){
     if (scannedUid.size > sizeof(event.uid)) return false;
+
+    event.eventId = nextScanEventId;
+    ++nextScanEventId;
 
     for (size_t index = 0; index < scannedUid.size; ++index) {
         event.uid[index] = scannedUid.uidByte[index];
@@ -346,6 +394,8 @@ bool buildScanEvent(const MFRC522::Uid& scannedUid, unsigned long currentMillis,
     event.cardType = rfid.PICC_GetType(scannedUid.sak);
     event.matchedTag = findRegisteredTag(scannedUid);
     event.occurredAtMillis = currentMillis;
+    event.occurredAtEpoch = time(nullptr);
+    event.hasValidTimestamp = event.occurredAtEpoch >= MIN_VALID_EPOCH;
 
     return true;
 }
@@ -482,4 +532,196 @@ void updateDisplay(unsigned long currentMillis) {
 
     showReadyScreen();
     displayState = DisplayState::Ready;
+}
+
+void setFeedbackOutputs(bool active){
+    if (active) {
+        digitalWrite(FEEDBACK_LED_PIN, HIGH);
+        ledcWrite(BUZZER_PWM_CHANNEL, BUZZER_ON_DUTY);
+        return;
+    }
+
+    digitalWrite(FEEDBACK_LED_PIN, LOW);
+    ledcWrite(BUZZER_PWM_CHANNEL, BUZZER_OFF_DUTY);
+}
+
+void printScanEventJson(const ScanEvent& event){
+    char uidText[MAX_UID_LENGTH * 3] = {};
+    size_t position = 0;
+
+    for (size_t index = 0; index < event.uidLength; ++index) {
+        int writtenCharacterCount = snprintf(
+            uidText + position,
+            sizeof(uidText) - position,
+            index + 1 < event.uidLength ? "%02X:" : "%02X",
+            event.uid[index]
+        );
+
+        if (writtenCharacterCount < 0) {
+            Serial.println("Failed to format UID");
+            return;
+        }
+
+        position += static_cast<size_t>(writtenCharacterCount);
+    }
+
+    JsonDocument document;
+
+    document["event"] = "rfid_scan";
+    document["event_id"] = event.eventId;
+    document["uptime_ms"] = event.occurredAtMillis;
+    document["uid"] = uidText;
+    document["card_type"] = rfid.PICC_GetTypeName(event.cardType);
+    
+    if (event.matchedTag == nullptr) {
+        document["access"] = "denied";
+        document["tag_name"] = nullptr;
+    } else {
+        document["access"] = "granted";
+        document["tag_name"] = event.matchedTag->name;
+    }
+
+    char timestampText[21] = {};
+
+    if (event.hasValidTimestamp && formatUtcTimestamp(event.occurredAtEpoch, timestampText, sizeof(timestampText))){
+        document["timestamp_utc"] = timestampText;
+    } else {
+        document["timestamp_utc"] = nullptr;
+    }
+
+    serializeJson(document, Serial);
+    Serial.println();
+}
+
+void startWifiConnection(unsigned long currentMillis){
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(WIFI_SSID);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    lastWifiConnectionAttemptMillis = currentMillis;
+}
+
+void updateNetwork(unsigned long currentMillis) {
+    bool isWifiConnected = WiFi.status() == WL_CONNECTED;
+
+    if (isWifiConnected) {
+        if (!wasWifiConnected) {
+            Serial.println("WiFi Connected");
+
+            Serial.print("IP Address: ");
+            Serial.println(WiFi.localIP());
+
+            Serial.print("Signal strength: ");
+            Serial.print(WiFi.RSSI());
+            Serial.println(" dBm");
+        }
+
+        wasWifiConnected = true;
+
+        if (!hasConfiguredNtp) {
+            configTime(
+                0,
+                0,
+                NTP_SERVER_PRIMARY,
+                NTP_SERVER_SECONDARY
+            );
+
+            hasConfiguredNtp = true;
+            Serial.println("NTP synchronization requested");
+        }
+
+        return;
+    }
+
+    if (wasWifiConnected) {
+        Serial.println("WiFi Disconnected");
+    }
+
+    wasWifiConnected = false;
+
+    unsigned long elapsedMillis = currentMillis - lastWifiConnectionAttemptMillis;
+
+    if (elapsedMillis < WIFI_RECONNECT_INTERVAL_MS) {
+        return;
+    }
+
+    Serial.println("Attempting WiFi Reconnecting...");
+
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    lastWifiConnectionAttemptMillis = currentMillis;
+}
+
+bool formatUtcTimestamp(time_t epoch, char* destination, size_t destinationSize) {
+    if (destination == nullptr || destinationSize == 0) {
+        return false;
+    }
+
+    struct tm utcTime {};
+
+    if (gmtime_r(&epoch, &utcTime) == nullptr) {
+        return false;
+    }
+
+    size_t writtenCharacterCount = strftime(
+        destination,
+        destinationSize,
+        "%Y-%m-%dT%H:%M:%SZ",
+        &utcTime
+    );
+
+    return writtenCharacterCount > 0;
+}
+
+void updateMqtt(unsigned long currentMillis){
+    if (WiFi.status() != WL_CONNECTED) {
+        if (mqttClient.connected()) {
+            mqttClient.disconnect();
+        }
+
+        wasMqttConnected = false;
+        return;
+    }
+
+    if (mqttClient.connected()) {
+        if (!wasMqttConnected) {
+            Serial.println("MQTT Connected");
+        }
+
+        wasMqttConnected = true;
+        mqttClient.loop();
+        return;
+    }
+
+    if (wasMqttConnected) Serial.println("MQTT Disconnected");
+
+    wasMqttConnected = false;
+
+    unsigned long elapsedMillis = currentMillis - lastMqttConnectionAttemptMillis;
+
+    if (hasAttemptedMqttConnection && elapsedMillis < MQTT_RECONNECT_INTERVAL_MS) return;
+
+    hasAttemptedMqttConnection = true;
+    lastMqttConnectionAttemptMillis = currentMillis;
+
+    Serial.print("Connecting to MQTT broker: ");
+    Serial.print(MQTT_BROKER_HOST);
+    Serial.print(':');
+    Serial.println(MQTT_BROKER_PORT);
+
+    if (!mqttClient.connect(MQTT_CLIENT_ID)) {
+        Serial.print("MQTT Connection failed. State: ");
+        Serial.println(mqttClient.state());
+        return;
+    }
+
+    Serial.println("MQTT Connection established");
+
+    bool published = mqttClient.publish(MQTT_STATUS_TOPIC, "{\"status\":\"online\"}", true);
+
+    if (published) Serial.println("MQTT online status published");
+    else Serial.println("Failed to publish MQTT online status");
 }
