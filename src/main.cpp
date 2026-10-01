@@ -30,6 +30,9 @@ const size_t MAX_UID_LENGTH = 10;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const time_t MIN_VALID_EPOCH = 1700000000;
+const size_t MQTT_JSON_BUFFER_SIZE = 384;
+const size_t MAX_MQTT_COMMAND_LENGTH = 32;
+const size_t MQTT_COMMAND_RESPONSE_BUFFER_SIZE = 256;
 const char NTP_SERVER_PRIMARY[] = "pool.ntp.org";
 const char NTP_SERVER_SECONDARY[] = "time.google.com";
 const char MQTT_BROKER_HOST[] = "192.168.1.2";
@@ -37,6 +40,10 @@ const uint16_t MQTT_BROKER_PORT = 1883;
 const char MQTT_CLIENT_ID[] = "smart-asset-station-01";
 const char MQTT_EVENT_TOPIC[] = "smart-asset/station-01/rfid/events";
 const char MQTT_STATUS_TOPIC[] = "smart-asset/station-01/status";
+const char MQTT_COMMAND_TOPIC[] = "smart-asset/station-01/commands";
+const char MQTT_COMMAND_RESPONSE_TOPIC[] = "smart-asset/station-01/commands/response";
+const char MQTT_ONLINE_PAYLOAD[] = "{\"status\":\"online\"}";
+const char MQTT_OFFLINE_PAYLOAD[] = "{\"status\":\"offline\"}";
 
 enum class TagIdentity {
     Unknown,
@@ -169,7 +176,11 @@ void updateDisplay(unsigned long currentMillis);
 
 void setFeedbackOutputs(bool active);
 
+bool serializeScanEventJson(const ScanEvent& event, char* destination, size_t destinationSize);
+
 void printScanEventJson(const ScanEvent& event);
+
+bool publishScanEvent(const ScanEvent& event);
 
 void startWifiConnection(unsigned long currentMillis);
 
@@ -179,13 +190,19 @@ bool formatUtcTimestamp(time_t epoch, char* destination, size_t destinationSize)
 
 void updateMqtt(unsigned long currentMillis);
 
+void handleMqttMessage(char* topic, byte* payload, unsigned int length);
+
+bool publishCommandResponse(const char* command, const char* status, const char* message);
+
 void setup()
 {
     Serial.begin(115200);
     startWifiConnection(millis());
     mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+    mqttClient.setCallback(handleMqttMessage);
     mqttClient.setKeepAlive(30);
     mqttClient.setSocketTimeout(2);
+    mqttClient.setBufferSize(512);
     ledcSetup(BUZZER_PWM_CHANNEL, BUZZER_FREQUENCY_HZ, BUZZER_PWM_RESOLUTION_BITS);
     ledcAttachPin(BUZZER_PIN, BUZZER_PWM_CHANNEL);
     ledcWrite(BUZZER_PWM_CHANNEL, BUZZER_OFF_DUTY);
@@ -376,6 +393,7 @@ void updateRfid(unsigned long currentMillis) {
     
     printScanEvent(scanEvent);
     printScanEventJson(scanEvent);
+    publishScanEvent(scanEvent);
     handleScanEvent(scanEvent);
     rfid.PICC_HaltA(); // Halt PICC
 }
@@ -545,7 +563,11 @@ void setFeedbackOutputs(bool active){
     ledcWrite(BUZZER_PWM_CHANNEL, BUZZER_OFF_DUTY);
 }
 
-void printScanEventJson(const ScanEvent& event){
+bool serializeScanEventJson(const ScanEvent& event, char* destination, size_t destinationSize){
+    if (destination == nullptr || destinationSize == 0) {
+        return false;
+    }
+
     char uidText[MAX_UID_LENGTH * 3] = {};
     size_t position = 0;
 
@@ -557,22 +579,23 @@ void printScanEventJson(const ScanEvent& event){
             event.uid[index]
         );
 
-        if (writtenCharacterCount < 0) {
-            Serial.println("Failed to format UID");
-            return;
-        }
+        if (writtenCharacterCount < 0) return false;
+        
+        size_t writtenSize = static_cast<size_t>(writtenCharacterCount);
 
-        position += static_cast<size_t>(writtenCharacterCount);
+        if (writtenSize >= sizeof(uidText) - position) return false;
+
+        position += writtenSize;
     }
-
     JsonDocument document;
 
     document["event"] = "rfid_scan";
     document["event_id"] = event.eventId;
+    document["device_id"] = MQTT_CLIENT_ID;
     document["uptime_ms"] = event.occurredAtMillis;
     document["uid"] = uidText;
     document["card_type"] = rfid.PICC_GetTypeName(event.cardType);
-    
+
     if (event.matchedTag == nullptr) {
         document["access"] = "denied";
         document["tag_name"] = nullptr;
@@ -589,8 +612,55 @@ void printScanEventJson(const ScanEvent& event){
         document["timestamp_utc"] = nullptr;
     }
 
-    serializeJson(document, Serial);
-    Serial.println();
+    size_t requiredSize = measureJson(document);
+    
+    if (requiredSize + 1 > destinationSize) return false;
+
+    size_t serializedSize = serializeJson(
+        document, destination, destinationSize
+    );
+
+    return serializedSize == requiredSize;
+}
+
+void printScanEventJson(const ScanEvent& event){
+    char payload[MQTT_JSON_BUFFER_SIZE] = {};
+
+    if (!serializeScanEventJson(event, payload, sizeof(payload))) {
+        Serial.println("Failed to serialize scan event JSON");
+        return;
+    }
+
+    Serial.println(payload);
+}
+
+bool publishScanEvent(const ScanEvent& event) {
+    if (!mqttClient.connected()) {
+        Serial.println("MQTT unavailable. Scan was not published");
+    
+        return false;
+    }
+
+    char payload[MQTT_JSON_BUFFER_SIZE] = {};
+
+    if (!serializeScanEventJson(event, payload, sizeof(payload))) {
+        Serial.println("Failed to serialize MQTT scan event");
+        return false;
+    }
+
+    bool published = mqttClient.publish(
+        MQTT_EVENT_TOPIC,
+        payload,
+        false
+    );
+
+    if (published) {
+        Serial.println("Scan event published to MQTT");
+    } else {
+        Serial.println("Failed to publish scan event to MQTT");
+    }
+
+    return published;
 }
 
 void startWifiConnection(unsigned long currentMillis){
@@ -712,7 +782,7 @@ void updateMqtt(unsigned long currentMillis){
     Serial.print(':');
     Serial.println(MQTT_BROKER_PORT);
 
-    if (!mqttClient.connect(MQTT_CLIENT_ID)) {
+    if (!mqttClient.connect(MQTT_CLIENT_ID, nullptr, nullptr, MQTT_STATUS_TOPIC, 0, true, MQTT_OFFLINE_PAYLOAD)) {
         Serial.print("MQTT Connection failed. State: ");
         Serial.println(mqttClient.state());
         return;
@@ -720,8 +790,127 @@ void updateMqtt(unsigned long currentMillis){
 
     Serial.println("MQTT Connection established");
 
-    bool published = mqttClient.publish(MQTT_STATUS_TOPIC, "{\"status\":\"online\"}", true);
+    bool published = mqttClient.publish(MQTT_STATUS_TOPIC, MQTT_ONLINE_PAYLOAD, true);
 
     if (published) Serial.println("MQTT online status published");
     else Serial.println("Failed to publish MQTT online status");
+
+    bool subscribed = mqttClient.subscribe(MQTT_COMMAND_TOPIC);
+
+    if (subscribed) Serial.println("Subscribed to MQTT command topic");
+    else Serial.println("Fail to subs to MQTT command topic");
+}
+
+void handleMqttMessage(char* topic, byte* payload, unsigned int length){
+    Serial.print("MQTT message received on topic: ");
+    Serial.println(topic);
+
+    if (strcmp(topic, MQTT_COMMAND_TOPIC) != 0) {
+        Serial.println("Unknown MQTT topic. Ignoring.");
+        return;
+    }
+
+    if (length == 0 || length > MAX_MQTT_COMMAND_LENGTH) {
+        Serial.println("Invalid MQTT command length");
+        publishCommandResponse("unknown", "error", "Invalid command length");
+        return;
+    }
+
+    char command[MAX_MQTT_COMMAND_LENGTH + 1] = {};
+
+    memcpy(command, payload, length);
+    command[length] = '\0';
+
+    Serial.print("Command: ");
+    Serial.println(command);
+
+    if (strcmp(command, "buzzer_test") == 0) {
+        startFeedback(FeedbackType::Denied, millis());
+        Serial.println("Buzzer test executed");
+
+        publishCommandResponse(command, "success", "Buzzer test executed");
+        return;
+    }
+
+    if (strcmp(command, "show_ready") == 0) {
+        showReadyScreen();
+        displayState = DisplayState::Ready;
+
+        Serial.println("Ready screen displayed");
+        publishCommandResponse(command, "success", "Ready screen displayed");
+        return;
+    }
+
+    if (strcmp(command, "device_status") == 0) {
+        bool published = mqttClient.publish(
+            MQTT_STATUS_TOPIC,
+            MQTT_ONLINE_PAYLOAD,
+            true
+        );
+
+        if (published) {
+            Serial.println("Device status published");
+            publishCommandResponse(command, "success", "Device status published");
+        }
+        else {
+            Serial.println("Failed to publish device status");
+            publishCommandResponse(command, "error", "Failed to publish device status");
+        }
+        
+        return;
+    }
+    
+    Serial.println("Unknown MQTT Command");
+    publishCommandResponse(command, "error", "Unknown Command");
+}
+
+bool publishCommandResponse(const char* command, const char* status, const char* message){
+    if (!mqttClient.connected()){
+        Serial.println("Cannot publish command response: MQTT unavailable");
+        return false;
+    }
+
+    JsonDocument document;
+
+    document["event"] = "command_response";
+    document["device_id"] = MQTT_CLIENT_ID;
+    document["command"] = command;
+    document["status"] = status;
+    document["message"] = message;
+    document["uptime_ms"] = millis();
+
+    char payload[MQTT_COMMAND_RESPONSE_BUFFER_SIZE] = {};
+
+    size_t requiredSize = measureJson(document);
+
+    if (requiredSize >= sizeof(payload)) {
+        Serial.println("Command response payload is too large");
+        return false;
+    }
+
+    size_t serializedSize = serializeJson(
+        document,
+        payload,
+        sizeof(payload)
+    );
+
+    if (serializedSize != requiredSize) {
+        Serial.println("Failed to serialize command response JSON");
+        return false;
+    }
+
+    bool published = mqttClient.publish(
+        MQTT_COMMAND_RESPONSE_TOPIC,
+        payload,
+        false
+    );
+
+    if (published) {
+        Serial.print("Command response published: ");
+        Serial.println(payload);
+    } else {
+        Serial.println("Failed to publish command response");
+    }
+
+    return published;
 }
